@@ -1,15 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  EOS Queue — Dashboard Page
+//  GET /api/metrics — Queue Metrics Snapshot
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Suspense } from "react";
-import Dashboard from "@/components/dashboard/Dashboard";
-import LoadingScreen from "@/components/ui/LoadingScreen";
+import { NextResponse } from "next/server";
+import { broker } from "@/lib/broker";
 
-export default function DashboardPage() {
-  return (
-    <Suspense fallback={<LoadingScreen />}>
-      <Dashboard />
-    </Suspense>
-  );
+export async function GET() {
+  try {
+    const metrics = await broker.getMetrics();
+    return NextResponse.json({ metrics, timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error("[GET /api/metrics]", err);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
 }
