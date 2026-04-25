@@ -1,17 +1,7 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  EOS Queue — 3D Pipeline Visualization
-//  Phase 4.2 & 4.3: R3F scene with task spheres flowing through a pipeline
-// ─────────────────────────────────────────────────────────────────────────────
-
 "use client";
 
-import { useRef, useMemo, useEffect, Suspense } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { OrbitControls, Text, Sphere, Box, Torus } from "@react-three/drei";
-import * as THREE from "three";
 import type { QueueMetrics, Task } from "@/types";
 
-// ── Color map for statuses ────────────────────────────────────────────────────
 const STATUS_COLORS: Record<string, string> = {
   PENDING:    "#94A3B8",
   CLAIMED:    "#F5C518",
@@ -20,327 +10,202 @@ const STATUS_COLORS: Record<string, string> = {
   RECOVERING: "#F97316",
 };
 
-// ── Individual task sphere ─────────────────────────────────────────────────────
-function TaskSphere({
-  position, color, pulsing = false, scale = 1,
-}: {
-  position: [number, number, number];
-  color: string;
-  pulsing?: boolean;
-  scale?: number;
-}) {
-  const meshRef    = useRef<THREE.Mesh>(null);
-  const glowRef    = useRef<THREE.Mesh>(null);
-  const timeOffset = useRef(Math.random() * Math.PI * 2);
+const NODES = [
+  { id: "producer",  label: "PRODUCER",  color: "#8B5CF6", countKey: null },
+  { id: "pending",   label: "PENDING",   color: "#94A3B8", countKey: "pending" },
+  { id: "claimed",   label: "CLAIMED",   color: "#F5C518", countKey: "claimed" },
+  { id: "completed", label: "COMPLETED", color: "#10B981", countKey: "completed" },
+  { id: "sink",      label: "SINK",      color: "#06B6D4", countKey: null },
+];
 
-  useFrame((state) => {
-    if (!meshRef.current) return;
-    const t = state.clock.elapsedTime + timeOffset.current;
-    if (pulsing) {
-      const s = scale * (1 + Math.sin(t * 3) * 0.08);
-      meshRef.current.scale.setScalar(s);
-    }
-    meshRef.current.rotation.y += 0.01;
-    if (glowRef.current) {
-      glowRef.current.scale.setScalar(scale * (1.5 + Math.sin(t * 2) * 0.1));
-      (glowRef.current.material as THREE.MeshBasicMaterial).opacity =
-        0.06 + Math.sin(t * 2) * 0.02;
-    }
-  });
+const NODE_CX = [70, 195, 320, 445, 570];
+const CY = 90;
+const R  = 30;
+
+interface Props { metrics: QueueMetrics; tasks: Task[] }
+
+export default function PipelineVisualization({ metrics, tasks }: Props) {
+  const getCount = (key: string | null): number | null => {
+    if (!key) return null;
+    return (metrics as unknown as Record<string, number>)[key] ?? 0;
+  };
+
+  const taskDots = tasks.slice(0, 50);
 
   return (
-    <group position={position}>
-      {/* Glow sphere */}
-      <Sphere ref={glowRef} args={[0.18, 12, 12]}>
-        <meshBasicMaterial color={color} transparent opacity={0.08} depthWrite={false} />
-      </Sphere>
-      {/* Main sphere */}
-      <Sphere ref={meshRef} args={[0.12, 16, 16]} scale={scale}>
-        <meshStandardMaterial
-          color={color}
-          emissive={color}
-          emissiveIntensity={0.4}
-          metalness={0.3}
-          roughness={0.2}
-        />
-      </Sphere>
-    </group>
-  );
-}
+    <div className="w-full h-full flex flex-col items-center justify-center gap-3 p-4 select-none overflow-hidden">
 
-// ── Pipeline node (box representing a stage) ──────────────────────────────────
-function PipelineNode({
-  position, label, color, count,
-}: {
-  position: [number, number, number];
-  label:    string;
-  color:    string;
-  count:    number;
-}) {
-  const meshRef = useRef<THREE.Mesh>(null);
-  const ringRef = useRef<THREE.Mesh>(null);
+      {/* ── SVG Pipeline ───────────────────────────────────────────────── */}
+      <svg viewBox="0 0 640 210" className="w-full" style={{ maxHeight: 190 }}>
+        <defs>
+          {/* Particle paths */}
+          <path id="path-0" d={`M${NODE_CX[0]+R},${CY} L${NODE_CX[1]-R},${CY}`} />
+          <path id="path-1" d={`M${NODE_CX[1]+R},${CY} L${NODE_CX[2]-R},${CY}`} />
+          <path id="path-2" d={`M${NODE_CX[2]+R},${CY} L${NODE_CX[3]-R},${CY}`} />
+          <path id="path-3" d={`M${NODE_CX[3]+R},${CY} L${NODE_CX[4]-R},${CY}`} />
+          <path id="path-dlq" d={`M${NODE_CX[2]},${CY+R} L${NODE_CX[2]},175`} />
+        </defs>
 
-  useFrame((state) => {
-    if (!meshRef.current || !ringRef.current) return;
-    const t = state.clock.elapsedTime;
-    meshRef.current.rotation.y = Math.sin(t * 0.5) * 0.05;
-    ringRef.current.rotation.z += 0.005;
-    ringRef.current.rotation.x += 0.003;
-  });
-
-  return (
-    <group position={position}>
-      {/* Rotating ring */}
-      <Torus ref={ringRef} args={[0.4, 0.02, 8, 32]}>
-        <meshBasicMaterial color={color} transparent opacity={0.3} />
-      </Torus>
-
-      {/* Main node box */}
-      <Box ref={meshRef} args={[0.6, 0.6, 0.6]}>
-        <meshStandardMaterial
-          color="#1A2235"
-          emissive={color}
-          emissiveIntensity={0.08}
-          metalness={0.6}
-          roughness={0.3}
-          wireframe={false}
-        />
-      </Box>
-
-      {/* Wireframe overlay */}
-      <Box args={[0.62, 0.62, 0.62]}>
-        <meshBasicMaterial color={color} transparent opacity={0.15} wireframe />
-      </Box>
-
-      {/* Label */}
-      <Text
-        position={[0, -0.65, 0]}
-        fontSize={0.14}
-        color={color}
-        anchorX="center"
-        anchorY="middle"
-        font="/fonts/JetBrainsMono-Regular.ttf"
-      >
-        {label}
-      </Text>
-
-      {/* Count badge */}
-      <Text
-        position={[0, 0, 0.35]}
-        fontSize={0.18}
-        color={color}
-        anchorX="center"
-        anchorY="middle"
-        font="/fonts/JetBrainsMono-Regular.ttf"
-      >
-        {count.toString()}
-      </Text>
-    </group>
-  );
-}
-
-// ── Connecting pipe (tube between nodes) ──────────────────────────────────────
-function Pipe({ from, to, color = "#243352" }: { from: [number,number,number]; to: [number,number,number]; color?: string }) {
-  const geometry = useMemo(() => {
-    const curve = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(...from),
-      new THREE.Vector3((from[0] + to[0]) / 2, from[1] + 0.3, (from[2] + to[2]) / 2),
-      new THREE.Vector3(...to),
-    ]);
-    return new THREE.TubeGeometry(curve, 20, 0.03, 6, false);
-  }, [from, to]);
-
-  return (
-    <mesh geometry={geometry}>
-      <meshStandardMaterial color={color} transparent opacity={0.4} metalness={0.5} roughness={0.5} />
-    </mesh>
-  );
-}
-
-// ── Animated flowing particles along pipes ────────────────────────────────────
-function FlowParticle({ from, to, speed = 1, color }: {
-  from: [number,number,number]; to: [number,number,number]; speed?: number; color: string;
-}) {
-  const meshRef  = useRef<THREE.Mesh>(null);
-  const progress = useRef(Math.random());
-  const curve    = useMemo(() => new THREE.CatmullRomCurve3([
-    new THREE.Vector3(...from),
-    new THREE.Vector3((from[0] + to[0]) / 2, from[1] + 0.3, (from[2] + to[2]) / 2),
-    new THREE.Vector3(...to),
-  ]), [from, to]);
-
-  useFrame((_, delta) => {
-    if (!meshRef.current) return;
-    progress.current = (progress.current + delta * speed * 0.25) % 1;
-    const pt = curve.getPoint(progress.current);
-    meshRef.current.position.set(pt.x, pt.y, pt.z);
-  });
-
-  return (
-    <Sphere ref={meshRef} args={[0.04, 6, 6]}>
-      <meshBasicMaterial color={color} />
-    </Sphere>
-  );
-}
-
-// ── DLQ Danger Box ─────────────────────────────────────────────────────────────
-function DLQBox({ position, count }: { position: [number,number,number]; count: number }) {
-  const meshRef = useRef<THREE.Mesh>(null);
-
-  useFrame((state) => {
-    if (!meshRef.current) return;
-    meshRef.current.rotation.x += 0.005;
-    meshRef.current.rotation.y += 0.008;
-    const t = state.clock.elapsedTime;
-    meshRef.current.position.y = position[1] + Math.sin(t * 1.5) * 0.05;
-  });
-
-  return (
-    <group position={position}>
-      <Box ref={meshRef} args={[0.55, 0.55, 0.55]}>
-        <meshStandardMaterial color="#1a0a0a" emissive="#EF4444" emissiveIntensity={0.15} metalness={0.7} roughness={0.2} />
-      </Box>
-      <Box args={[0.58, 0.58, 0.58]}>
-        <meshBasicMaterial color="#EF4444" transparent opacity={0.2} wireframe />
-      </Box>
-      <Text position={[0, -0.65, 0]} fontSize={0.13} color="#EF4444" anchorX="center">DLQ</Text>
-      <Text position={[0, 0, 0.32]} fontSize={0.18} color="#EF4444" anchorX="center">{count.toString()}</Text>
-    </group>
-  );
-}
-
-// ── Scene camera rig ──────────────────────────────────────────────────────────
-function CameraSetup() {
-  const { camera } = useThree();
-  useEffect(() => {
-    camera.position.set(0, 2.5, 6);
-    camera.lookAt(0, 0, 0);
-  }, [camera]);
-  return null;
-}
-
-// ── Grid Floor ────────────────────────────────────────────────────────────────
-function GridFloor() {
-  return (
-    <gridHelper args={[20, 20, "#1E2D45", "#111827"]} position={[0, -1.5, 0]} />
-  );
-}
-
-// ── Main 3D Scene ─────────────────────────────────────────────────────────────
-function PipelineScene({ metrics, tasks }: { metrics: QueueMetrics; tasks: Task[] }) {
-  // Node positions along a horizontal pipeline
-  const nodes: Array<{ pos: [number,number,number]; label: string; color: string; count: number }> = [
-    { pos: [-4.5, 0, 0], label: "PRODUCER",  color: "#8B5CF6", count: 0            },
-    { pos: [-2,   0, 0], label: "PENDING",   color: "#94A3B8", count: metrics.pending    },
-    { pos: [0,    0, 0], label: "CLAIMED",   color: "#F5C518", count: metrics.claimed    },
-    { pos: [2,    0, 0], label: "COMPLETED", color: "#10B981", count: metrics.completed  },
-    { pos: [4.5,  0, 0], label: "SINK",      color: "#06B6D4", count: 0            },
-  ];
-
-  // Scatter task spheres near their respective node
-  const taskSpheres = useMemo(() => {
-    return tasks.slice(0, 30).map((t) => {
-      const nodeIdx = ["PENDING","CLAIMED","COMPLETED","FAILED","RECOVERING"]
-        .indexOf(t.status);
-      const baseX = [-2, 0, 2, 2, 0][Math.max(0, nodeIdx)];
-      return {
-        id:    t.task_id,
-        color: STATUS_COLORS[t.status] || "#94A3B8",
-        pos: [
-          baseX + (Math.random() - 0.5) * 1.2,
-          (Math.random() - 0.5) * 0.8,
-          (Math.random() - 0.5) * 1.2,
-        ] as [number,number,number],
-        pulsing: t.status === "CLAIMED",
-      };
-    });
-  }, [tasks]);
-
-  return (
-    <>
-      <CameraSetup />
-      <GridFloor />
-
-      {/* Lighting */}
-      <ambientLight intensity={0.3} />
-      <pointLight position={[0,  4, 2]} intensity={1}   color="#F5C518" />
-      <pointLight position={[-4, 2, 2]} intensity={0.5} color="#8B5CF6" />
-      <pointLight position={[4,  2, 2]} intensity={0.5} color="#06B6D4" />
-      <pointLight position={[2,  3, 2]} intensity={0.8} color="#10B981" />
-
-      {/* Pipes */}
-      {nodes.slice(0, -1).map((n, i) => (
-        <Pipe key={i} from={n.pos} to={nodes[i + 1].pos} color="#243352" />
-      ))}
-      {/* Fail branch pipe to DLQ */}
-      <Pipe from={[0, 0, 0]} to={[0, -1.8, 0]} color="#EF444440" />
-
-      {/* Flow particles */}
-      {Array.from({ length: 4 }).map((_, i) => (
-        <FlowParticle key={`p-pend-${i}`} from={[-4.5,0,0]} to={[-2,0,0]} speed={0.6 + i * 0.15} color="#8B5CF6" />
-      ))}
-      {Array.from({ length: 3 }).map((_, i) => (
-        <FlowParticle key={`p-claim-${i}`} from={[-2,0,0]} to={[0,0,0]} speed={0.5 + i * 0.2} color="#F5C518" />
-      ))}
-      {Array.from({ length: 4 }).map((_, i) => (
-        <FlowParticle key={`p-comp-${i}`} from={[0,0,0]} to={[2,0,0]} speed={0.7 + i * 0.1} color="#10B981" />
-      ))}
-      {Array.from({ length: 2 }).map((_, i) => (
-        <FlowParticle key={`p-sink-${i}`} from={[2,0,0]} to={[4.5,0,0]} speed={0.8 + i * 0.2} color="#06B6D4" />
-      ))}
-
-      {/* Pipeline nodes */}
-      {nodes.map((n, i) => (
-        <PipelineNode key={i} position={n.pos} label={n.label} color={n.color} count={n.count} />
-      ))}
-
-      {/* DLQ box below the pipeline */}
-      <DLQBox position={[0, -2.2, 0]} count={metrics.dlq} />
-
-      {/* Task spheres */}
-      {taskSpheres.map((s) => (
-        <TaskSphere key={s.id} position={s.pos} color={s.color} pulsing={s.pulsing} />
-      ))}
-
-      {/* Recovering spheres orbiting the CLAIMED node */}
-      {metrics.recovering > 0 && Array.from({ length: Math.min(metrics.recovering, 5) }).map((_, i) => {
-        const angle = (i / 5) * Math.PI * 2;
-        return (
-          <TaskSphere key={`rec-${i}`}
-            position={[Math.cos(angle) * 0.9, Math.sin(angle) * 0.9, 0]}
-            color="#F97316" pulsing scale={0.8}
+        {/* ── Pipe connectors ─────────────────────────────────────────── */}
+        {NODE_CX.slice(0,-1).map((cx, i) => (
+          <line key={i}
+            x1={cx + R} y1={CY}
+            x2={NODE_CX[i+1] - R} y2={CY}
+            stroke="#243352" strokeWidth={2.5} strokeDasharray="5 4"
           />
-        );
-      })}
+        ))}
 
-      <OrbitControls
-        enablePan={false} enableZoom={true}
-        minDistance={3}   maxDistance={12}
-        minPolarAngle={0.3} maxPolarAngle={Math.PI / 2}
-        autoRotate autoRotateSpeed={0.3}
-      />
-    </>
-  );
-}
+        {/* DLQ drop line */}
+        <line
+          x1={NODE_CX[2]} y1={CY + R}
+          x2={NODE_CX[2]} y2={172}
+          stroke="#EF444455" strokeWidth={2} strokeDasharray="4 3"
+        />
 
-// ── Public component ──────────────────────────────────────────────────────────
-export default function PipelineVisualization({
-  metrics, tasks,
-}: {
-  metrics: QueueMetrics;
-  tasks:   Task[];
-}) {
-  return (
-    <div className="w-full h-full">
-      <Canvas
-        camera={{ position: [0, 2.5, 6], fov: 50 }}
-        gl={{ antialias: true, alpha: true }}
-        style={{ background: "transparent" }}
-      >
-        <Suspense fallback={null}>
-          <PipelineScene metrics={metrics} tasks={tasks} />
-        </Suspense>
-      </Canvas>
+        {/* ── Flow particles (CSS animateMotion — zero JS) ─────────────── */}
+        {/* Producer → Pending */}
+        {["0s", "-1.2s"].map((begin, i) => (
+          <circle key={`p0-${i}`} r={3.5} fill="#8B5CF6" opacity={0.85}>
+            <animateMotion dur="2.2s" repeatCount="indefinite" begin={begin}>
+              <mpath href="#path-0" />
+            </animateMotion>
+          </circle>
+        ))}
+        {/* Pending → Claimed */}
+        {["0s", "-1.0s"].map((begin, i) => (
+          <circle key={`p1-${i}`} r={3.5} fill="#F5C518" opacity={0.85}>
+            <animateMotion dur="1.9s" repeatCount="indefinite" begin={begin}>
+              <mpath href="#path-1" />
+            </animateMotion>
+          </circle>
+        ))}
+        {/* Claimed → Completed */}
+        {["0s", "-0.9s"].map((begin, i) => (
+          <circle key={`p2-${i}`} r={3.5} fill="#10B981" opacity={0.85}>
+            <animateMotion dur="1.7s" repeatCount="indefinite" begin={begin}>
+              <mpath href="#path-2" />
+            </animateMotion>
+          </circle>
+        ))}
+        {/* Completed → Sink */}
+        <circle r={3.5} fill="#06B6D4" opacity={0.85}>
+          <animateMotion dur="2.0s" repeatCount="indefinite" begin="0s">
+            <mpath href="#path-3" />
+          </animateMotion>
+        </circle>
+        {/* Occasional fail particle to DLQ */}
+        <circle r={3} fill="#EF4444" opacity={0.7}>
+          <animateMotion dur="3s" repeatCount="indefinite" begin="-1s">
+            <mpath href="#path-dlq" />
+          </animateMotion>
+        </circle>
+
+        {/* ── Pipeline nodes ───────────────────────────────────────────── */}
+        {NODES.map((node, i) => {
+          const cx    = NODE_CX[i];
+          const count = getCount(node.countKey);
+          return (
+            <g key={node.id}>
+              {/* Pulse ring */}
+              <circle cx={cx} cy={CY} r={R + 7}
+                fill="none" stroke={node.color} strokeWidth={1} opacity={0.12}>
+                <animate attributeName="r"
+                  values={`${R+5};${R+11};${R+5}`}
+                  dur="3s" repeatCount="indefinite" />
+                <animate attributeName="opacity"
+                  values="0.12;0.04;0.12"
+                  dur="3s" repeatCount="indefinite" />
+              </circle>
+              {/* Node body */}
+              <circle cx={cx} cy={CY} r={R}
+                fill="#0D1220" stroke={node.color} strokeWidth={1.5} />
+              {/* Label */}
+              <text x={cx} y={CY - 7} textAnchor="middle"
+                fill={node.color} fontSize={7}
+                fontFamily="'JetBrains Mono', monospace" fontWeight="600"
+                letterSpacing="0.8">
+                {node.label}
+              </text>
+              {/* Count */}
+              <text x={cx} y={CY + 11} textAnchor="middle"
+                fill={node.color} fontSize={15}
+                fontFamily="'JetBrains Mono', monospace" fontWeight="700">
+                {count !== null ? count : "·"}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* ── DLQ box ──────────────────────────────────────────────────── */}
+        <rect x={NODE_CX[2] - 38} y={174} width={76} height={30}
+          rx={5} fill="#120505" stroke="#EF4444" strokeWidth={1.5}>
+          <animate attributeName="stroke-opacity"
+            values="1;0.3;1" dur="2s" repeatCount="indefinite" />
+        </rect>
+        <text x={NODE_CX[2]} y={185} textAnchor="middle"
+          fill="#EF4444" fontSize={7}
+          fontFamily="'JetBrains Mono', monospace" fontWeight="600">
+          DEAD LETTER
+        </text>
+        <text x={NODE_CX[2]} y={199} textAnchor="middle"
+          fill="#EF4444" fontSize={13}
+          fontFamily="'JetBrains Mono', monospace" fontWeight="700">
+          {metrics.dlq}
+        </text>
+
+        {/* ── Recovering badge ─────────────────────────────────────────── */}
+        {metrics.recovering > 0 && (
+          <g>
+            <circle cx={NODE_CX[2] - 48} cy={CY - 42} r={16}
+              fill="#F9731608" stroke="#F97316" strokeWidth={1.5}
+              strokeDasharray="3 2">
+              <animateTransform attributeName="transform" type="rotate"
+                from={`0 ${NODE_CX[2]-48} ${CY-42}`}
+                to={`360 ${NODE_CX[2]-48} ${CY-42}`}
+                dur="4s" repeatCount="indefinite" />
+            </circle>
+            <text x={NODE_CX[2] - 48} y={CY - 38} textAnchor="middle"
+              fill="#F97316" fontSize={11}
+              fontFamily="'JetBrains Mono', monospace" fontWeight="700">
+              {metrics.recovering}
+            </text>
+            <text x={NODE_CX[2] - 48} y={CY - 28} textAnchor="middle"
+              fill="#F97316" fontSize={6}
+              fontFamily="'JetBrains Mono', monospace">
+              REC
+            </text>
+          </g>
+        )}
+      </svg>
+
+      {/* ── Task dot grid ─────────────────────────────────────────────── */}
+      {taskDots.length > 0 && (
+        <div className="w-full px-2">
+          <p className="text-[10px] font-mono text-text-muted mb-1.5 uppercase tracking-wider">
+            Live Tasks · {taskDots.length} shown
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {taskDots.map((task) => (
+              <div
+                key={task.task_id}
+                title={`${task.name} · ${task.status}`}
+                className="w-2.5 h-2.5 rounded-full cursor-default transition-transform hover:scale-150"
+                style={{ background: STATUS_COLORS[task.status] ?? "#475569" }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Legend ────────────────────────────────────────────────────── */}
+      <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
+        {Object.entries(STATUS_COLORS).map(([status, color]) => (
+          <div key={status} className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full" style={{ background: color }} />
+            <span className="text-[10px] font-mono text-text-muted">{status}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

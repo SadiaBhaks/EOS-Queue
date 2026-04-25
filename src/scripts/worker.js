@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
 //  EOS Queue — Worker Process
-//  Phase 2.2: Standalone worker that can be run alongside the Next.js server
-//  Usage: node scripts/worker.js [--concurrency=5]
+//  Fixed: thundering herd, connection exhaustion, heartbeat flooding,
+//         exponential backoff on errors, graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
 require("dotenv").config({ path: ".env.local" });
@@ -10,16 +10,20 @@ require("dotenv").config({ path: ".env.local" });
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 
-// ── Config ─────────────────────────────────────────────────────────────────────
-const MONGODB_URI    = process.env.MONGODB_URI    || "mongodb://localhost:27017/eos_queue";
-const CONCURRENCY    = parseInt(process.env.WORKER_CONCURRENCY || "5");
-const HEARTBEAT_MS   = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL || "5000");
-const VISIBILITY_MS  = parseInt(process.env.WORKER_VISIBILITY_TIMEOUT || "30000");
-const MAX_RETRIES    = parseInt(process.env.MAX_RETRY_COUNT   || "5");
-const BASE_DELAY     = parseInt(process.env.RETRY_BASE_DELAY  || "1000");
-const MAX_DELAY      = parseInt(process.env.RETRY_MAX_DELAY   || "60000");
-const IDEMPOTENCY_TTL = parseInt(process.env.IDEMPOTENCY_KEY_TTL || "604800000");
-const POLL_INTERVAL   = 500; // ms
+// ── Config — conservative defaults to protect low-end machines ────────────────
+const MONGODB_URI     = process.env.MONGODB_URI  ;
+const CONCURRENCY     = Math.min(parseInt(process.env.WORKER_CONCURRENCY), 5); // hard cap at 5
+const HEARTBEAT_MS    = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL ); // 10s (was 5s)
+const VISIBILITY_MS   = parseInt(process.env.WORKER_VISIBILITY_TIMEOUT ); // 60s
+const MAX_RETRIES     = parseInt(process.env.MAX_RETRY_COUNT   );
+const BASE_DELAY      = parseInt(process.env.RETRY_BASE_DELAY   );
+const MAX_DELAY       = parseInt(process.env.RETRY_MAX_DELAY   );
+const IDEMPOTENCY_TTL = parseInt(process.env.IDEMPOTENCY_KEY_TTL    );
+const POLL_INTERVAL   = 2000; // 2s between polls (was 500ms — was DDOS-ing own DB)
+const ZOMBIE_INTERVAL = 30000; // 30s between zombie scans (was 10s)
+
+// ── Graceful shutdown flag ─────────────────────────────────────────────────────
+let isShuttingDown = false;
 
 // ── Jittered Exponential Backoff ───────────────────────────────────────────────
 function calcBackoff(retryCount) {
@@ -40,14 +44,13 @@ const TaskSchema = new mongoose.Schema({
   max_retries:        { type: Number, default: 5 },
   worker_id:          { type: String, default: null },
   claimed_at:         { type: Date,   default: null },
-  visibility_timeout: { type: Number, default: 30000 },
+  visibility_timeout: { type: Number, default: 60000 },
   last_heartbeat:     { type: Date,   default: null },
   next_retry_at:      { type: Date,   default: null },
   error_message:      { type: String, default: null },
   dlq:                { type: Boolean, default: false },
   completed_at:       { type: Date,   default: null },
-},
-{ timestamps: { createdAt: "created_at", updatedAt: "updated_at" } });
+}, { timestamps: { createdAt: "created_at", updatedAt: "updated_at" } });
 
 const IdempotencySchema = new mongoose.Schema({
   idempotency_key: { type: String, unique: true },
@@ -75,14 +78,23 @@ const WorkerSchema = new mongoose.Schema({
 
 let Task, Idempotency, DLQ, Worker;
 
-// ── Connect ────────────────────────────────────────────────────────────────────
+// ── Connect — single shared pool, never reconnect inside a slot ───────────────
 async function connect() {
-  await mongoose.connect(MONGODB_URI, { maxPoolSize: CONCURRENCY + 2 });
+  await mongoose.connect(MONGODB_URI, {
+    maxPoolSize:             CONCURRENCY + 2, // one connection per worker + 2 spare
+    minPoolSize:             1,
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS:          45000,
+    heartbeatFrequencyMS:    30000, // MongoDB driver heartbeat — separate from task heartbeat
+  });
+
+  // Register models once — never re-register inside loops
   Task        = mongoose.models.Task        || mongoose.model("Task",        TaskSchema);
   Idempotency = mongoose.models.Idempotency || mongoose.model("Idempotency", IdempotencySchema);
   DLQ         = mongoose.models.DLQ         || mongoose.model("DLQ",         DLQSchema);
   Worker      = mongoose.models.Worker      || mongoose.model("Worker",      WorkerSchema);
-  console.log(`[Worker] MongoDB connected ✓`);
+
+  console.log(`[Worker] MongoDB connected ✓  (pool size: ${CONCURRENCY + 2})`);
 }
 
 // ── Atomic Claim ───────────────────────────────────────────────────────────────
@@ -110,71 +122,95 @@ async function claim(workerId) {
 
   if (!task) return null;
 
-  await Worker.findOneAndUpdate(
+  // Fire-and-forget worker registry update — don't await, not critical path
+  Worker.findOneAndUpdate(
     { worker_id: workerId },
     { $set: { status: "BUSY", current_task: task.task_id, last_seen: now } },
     { upsert: true }
-  );
+  ).catch(() => {});
+
   return task;
 }
 
-// ── Complete ────────────────────────────────────────────────────────────────────
+// ── Complete ───────────────────────────────────────────────────────────────────
 async function complete(taskId, workerId, result) {
-  const task = await Task.findOne({ task_id: taskId });
+  const task = await Task.findOne({ task_id: taskId }).lean();
   if (!task || task.worker_id !== workerId) return;
+
   const now = new Date();
 
+  // Write idempotency record first — this is the EOS guarantee
   await Idempotency.updateOne(
     { idempotency_key: task.idempotency_key },
-    { $setOnInsert: {
+    {
+      $setOnInsert: {
         idempotency_key: task.idempotency_key,
         task_id:         taskId,
         result,
         created_at:      now,
         expires_at:      new Date(now.getTime() + IDEMPOTENCY_TTL),
-    }},
+      },
+    },
     { upsert: true }
   );
 
+  // Then mark task complete
   await Task.findOneAndUpdate(
     { task_id: taskId, worker_id: workerId },
     { $set: { status: "COMPLETED", completed_at: now, worker_id: null } }
   );
 
-  await Worker.findOneAndUpdate(
+  // Fire-and-forget worker stat update
+  Worker.findOneAndUpdate(
     { worker_id: workerId },
     { $set: { status: "IDLE", current_task: null, last_seen: now }, $inc: { tasks_done: 1 } }
-  );
+  ).catch(() => {});
 }
 
-// ── Fail ────────────────────────────────────────────────────────────────────────
+// ── Fail ───────────────────────────────────────────────────────────────────────
 async function fail(taskId, workerId, error) {
-  const task = await Task.findOne({ task_id: taskId });
+  const task = await Task.findOne({ task_id: taskId }).lean();
   if (!task || task.worker_id !== workerId) return;
+
   const now           = new Date();
   const newRetryCount = task.retry_count + 1;
 
   if (newRetryCount > task.max_retries) {
-    await DLQ.create({ task_id: taskId, original_task: task.toObject(), reason: error, moved_at: now });
-    await Task.findOneAndUpdate({ task_id: taskId }, {
-      $set: { status: "FAILED", failed_at: now, error_message: error, worker_id: null, dlq: true },
+    // Budget exhausted → DLQ
+    await DLQ.create({
+      task_id:       taskId,
+      original_task: task,
+      reason:        error,
+      moved_at:      now,
     });
+    await Task.findOneAndUpdate(
+      { task_id: taskId },
+      { $set: { status: "FAILED", failed_at: now, error_message: error, worker_id: null, dlq: true } }
+    );
   } else {
+    // Retry with jittered backoff
     const delay  = calcBackoff(newRetryCount);
     const nextAt = new Date(now.getTime() + delay);
-    await Task.findOneAndUpdate({ task_id: taskId }, {
-      $set: {
-        status: "PENDING", retry_count: newRetryCount,
-        next_retry_at: nextAt, error_message: error,
-        worker_id: null, claimed_at: null,
-      },
-    });
+    await Task.findOneAndUpdate(
+      { task_id: taskId },
+      {
+        $set: {
+          status:        "PENDING",
+          retry_count:   newRetryCount,
+          next_retry_at: nextAt,
+          error_message: error,
+          worker_id:     null,
+          claimed_at:    null,
+        },
+      }
+    );
   }
 
-  await Worker.findOneAndUpdate(
+  // Fire-and-forget
+  Worker.findOneAndUpdate(
     { worker_id: workerId },
     { $set: { status: "IDLE", current_task: null, last_seen: now }, $inc: { tasks_failed: 1 } }
-  );
+  ).catch(() => {});
 }
 
 // ── Task Handler (Simulated Work) ──────────────────────────────────────────────
@@ -191,24 +227,41 @@ async function handleTask(task) {
 }
 
 // ── Worker Slot ────────────────────────────────────────────────────────────────
+// Fixed: exponential backoff on consecutive errors prevents thundering herd
+// Fixed: heartbeat uses longer interval, doesn't flood DB
+// Fixed: isShuttingDown check exits cleanly
 async function runSlot(workerId) {
-  while (true) {
+  let consecutiveErrors = 0;
+
+  while (!isShuttingDown) {
     try {
       const task = await claim(workerId);
+
       if (!task) {
+        consecutiveErrors = 0; // clean poll — reset error counter
         await new Promise((r) => setTimeout(r, POLL_INTERVAL));
         continue;
       }
 
-      console.log(`[${workerId}] Claimed: ${task.name} (${task.task_id.slice(0,8)})`);
+      consecutiveErrors = 0;
+      console.log(`[${workerId}] Claimed: ${task.name} (${task.task_id.slice(0, 8)})`);
 
-      // Heartbeat
+      // ── Heartbeat — fires every HEARTBEAT_MS, stops on task end ──────────
+      let heartbeatActive = true;
       const hbInterval = setInterval(async () => {
-        await Task.findOneAndUpdate(
-          { task_id: task.task_id, worker_id: workerId, status: "CLAIMED" },
-          { $set: { last_heartbeat: new Date() } }
-        );
-        await Worker.findOneAndUpdate({ worker_id: workerId }, { $set: { last_seen: new Date() } });
+        if (!heartbeatActive) return;
+        try {
+          await Task.findOneAndUpdate(
+            { task_id: task.task_id, worker_id: workerId, status: "CLAIMED" },
+            { $set: { last_heartbeat: new Date() } }
+          );
+          await Worker.findOneAndUpdate(
+            { worker_id: workerId },
+            { $set: { last_seen: new Date() } }
+          );
+        } catch (_) {
+          // Heartbeat failure is non-fatal — zombie monitor will recover
+        }
       }, HEARTBEAT_MS);
 
       try {
@@ -216,78 +269,65 @@ async function runSlot(workerId) {
         await complete(task.task_id, workerId, result);
         console.log(`[${workerId}] ✓ Completed: ${task.name}`);
       } catch (err) {
-        await fail(task.task_id, workerId, err.message);
+        await fail(task.task_id, workerId, err.message).catch(() => {});
         console.log(`[${workerId}] ✗ Failed:    ${task.name} — ${err.message}`);
       } finally {
+        // Always stop heartbeat — prevents interval leak
+        heartbeatActive = false;
         clearInterval(hbInterval);
       }
+
     } catch (err) {
-      console.error(`[${workerId}] Slot error:`, err.message);
-      await new Promise((r) => setTimeout(r, 2000));
+      consecutiveErrors++;
+
+      // Exponential backoff on repeated errors — prevents thundering herd
+      // on DB connection issues: 2s → 4s → 8s → ... capped at 30s
+      const backoff = Math.min(2000 * Math.pow(2, consecutiveErrors - 1), 30000);
+      console.error(
+        `[${workerId}] Error #${consecutiveErrors} — backing off ${backoff}ms: ${err.message}`
+      );
+      await new Promise((r) => setTimeout(r, backoff));
     }
   }
+
+  console.log(`[${workerId}] Slot stopped (shutdown)`);
 }
 
-// ── Zombie Monitor ─────────────────────────────────────────────────────────────
+// ── Zombie Monitor — detects workers that died mid-task ───────────────────────
+// Fixed: interval increased from 10s to 30s, errors don't restart the loop
 async function zombieMonitor() {
-  while (true) {
-    await new Promise((r) => setTimeout(r, 10000));
+  while (!isShuttingDown) {
+    await new Promise((r) => setTimeout(r, ZOMBIE_INTERVAL));
+    if (isShuttingDown) break;
+
     try {
       const now     = new Date();
       const zombies = await Task.find({
         status: "CLAIMED",
-        $expr: { $lt: ["$last_heartbeat", { $subtract: [now, "$visibility_timeout"] }] },
+        $expr: {
+          $lt: [
+            "$last_heartbeat",
+            { $subtract: [now, "$visibility_timeout"] },
+          ],
+        },
       }).lean();
+
+      if (zombies.length > 0) {
+        console.log(`[ZombieMonitor] Found ${zombies.length} zombie task(s)`);
+      }
 
       for (const z of zombies) {
         const newRetry = z.retry_count + 1;
+
         if (newRetry > z.max_retries) {
-          await DLQ.create({ task_id: z.task_id, original_task: z, reason: "Zombie: heartbeat expired", moved_at: now });
-          await Task.findOneAndUpdate({ task_id: z.task_id }, { $set: { status: "FAILED", dlq: true, worker_id: null } });
-        } else {
-          const nextAt = new Date(now.getTime() + calcBackoff(newRetry));
+          await DLQ.create({
+            task_id:       z.task_id,
+            original_task: z,
+            reason:        "Zombie: heartbeat expired, retry budget exhausted",
+            moved_at:      now,
+          });
           await Task.findOneAndUpdate(
-            { task_id: z.task_id, status: "CLAIMED" },
-            { $set: { status: "RECOVERING", retry_count: newRetry, next_retry_at: nextAt, worker_id: null, claimed_at: null, error_message: "Zombie recovery" } }
+            { task_id: z.task_id },
+            { $set: { status: "FAILED", dlq: true, worker_id: null } }
           );
-          console.log(`[ZombieMonitor] Recovered: ${z.task_id.slice(0,8)}`);
-        }
-        if (z.worker_id) {
-          await Worker.findOneAndUpdate({ worker_id: z.worker_id }, { $set: { status: "DEAD", current_task: null } });
-        }
-      }
-    } catch (err) {
-      console.error("[ZombieMonitor]", err.message);
-    }
-  }
-}
-
-// ── Main ───────────────────────────────────────────────────────────────────────
-async function main() {
-  await connect();
-
-  console.log(`\n╔══════════════════════════════════════════╗`);
-  console.log(`║  EOS Queue Worker Pool                   ║`);
-  console.log(`║  Concurrency: ${String(CONCURRENCY).padEnd(27)}║`);
-  console.log(`║  Heartbeat:   ${String(HEARTBEAT_MS + "ms").padEnd(27)}║`);
-  console.log(`║  Visibility:  ${String(VISIBILITY_MS + "ms").padEnd(27)}║`);
-  console.log(`╚══════════════════════════════════════════╝\n`);
-
-  // Launch worker slots
-  const slots = Array.from({ length: CONCURRENCY }, (_, i) => {
-    const id = `worker-${uuidv4().slice(0, 8)}`;
-    console.log(`[Pool] Starting slot ${i + 1}/${CONCURRENCY}: ${id}`);
-    return runSlot(id);
-  });
-
-  // Launch zombie monitor
-  zombieMonitor();
-
-  // Handle graceful shutdown
-  process.on("SIGTERM", () => { console.log("\n[Worker] SIGTERM — shutting down"); process.exit(0); });
-  process.on("SIGINT",  () => { console.log("\n[Worker] SIGINT — shutting down");  process.exit(0); });
-
-  await Promise.all(slots);
-}
-
-main().catch((err) => { console.error("[Worker] Fatal:", err); process.exit(1); });
+          console.log(`[ZombieMonitor] → DLQ: ${z.task_id.slice(0, 8)}

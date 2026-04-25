@@ -1,0 +1,6 @@
+services:
+  taskqueue:
+    image: taskqueue
+    build:
+      context: .
+      dockerfile: ./Dockerfile
