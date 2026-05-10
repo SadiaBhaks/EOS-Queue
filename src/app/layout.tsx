@@ -1,9 +1,6 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  EOS Queue — Root Layout
-// ─────────────────────────────────────────────────────────────────────────────
 
 import type { Metadata } from "next";
-import "@/styles/globals.css";
+import "../styles/globals.css";
 
 export const metadata: Metadata = {
   title:       "EOS Queue — Exactly-Once Task Orchestration",

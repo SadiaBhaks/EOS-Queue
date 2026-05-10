@@ -1,15 +1,7 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  EOS Queue — Dashboard Page
-// ─────────────────────────────────────────────────────────────────────────────
+"use client";
 
-import { Suspense } from "react";
 import Dashboard from "@/components/dashboard/Dashboard";
-import LoadingScreen from "@/components/ui/LoadingScreen";
 
 export default function DashboardPage() {
-  return (
-    <Suspense fallback={<LoadingScreen />}>
-      <Dashboard />
-    </Suspense>
-  );
+  return <Dashboard />;
 }
