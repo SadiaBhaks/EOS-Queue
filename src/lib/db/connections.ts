@@ -1,15 +1,13 @@
 import mongoose from "mongoose";
 
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/eos_queue";
+const MONGODB_URI = process.env.MONGODB_URI || "";
 
 interface GlobalMongo {
   conn: typeof mongoose | null;
   promise: Promise<typeof mongoose> | null;
 }
 
-// Reuse connection across hot-reloads in Next.js dev mode
 declare global {
-  // eslint-disable-next-line no-var
   var __mongo: GlobalMongo | undefined;
 }
 
@@ -20,23 +18,17 @@ export async function connectDB(): Promise<typeof mongoose> {
   if (cached.conn) return cached.conn;
 
   if (!cached.promise) {
-    const opts: mongoose.ConnectOptions = {
-      bufferCommands: false,
-      maxPoolSize:    10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    };
-
     cached.promise = mongoose
-      .connect(MONGODB_URI, opts)
-      .then((m) => {
-        console.log("[DB] MongoDB connected ✓");
-        return m;
+      .connect(MONGODB_URI, {
+        bufferCommands:              false,
+        maxPoolSize:                 5,
+        serverSelectionTimeoutMS:    5000,  // fail fast — don't hang for 30s
+        socketTimeoutMS:             10000,
+        connectTimeoutMS:            5000,
+        heartbeatFrequencyMS:        30000,
       })
-      .catch((err) => {
-        cached.promise = null;
-        throw err;
-      });
+      .then((m) => { console.log("[DB] MongoDB connected ✓"); return m; })
+      .catch((err) => { cached.promise = null; throw err; });
   }
 
   cached.conn = await cached.promise;
