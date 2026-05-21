@@ -1,38 +1,34 @@
-import mongoose from "mongoose";
 
-const MONGODB_URI = process.env.MONGODB_URI || "";
+// ─────────────────────────────────────────────────────────────────────────────
+//  EOS Queue — PostgreSQL Connection Pool (Singleton)
+// ─────────────────────────────────────────────────────────────────────────────
 
-interface GlobalMongo {
-  conn: typeof mongoose | null;
-  promise: Promise<typeof mongoose> | null;
-}
+import { Pool } from "pg";
 
 declare global {
-  var __mongo: GlobalMongo | undefined;
+  var __pgPool: Pool | undefined;
 }
 
-const cached: GlobalMongo = global.__mongo ?? { conn: null, promise: null };
-global.__mongo = cached;
-
-export async function connectDB(): Promise<typeof mongoose> {
-  if (cached.conn) return cached.conn;
-
-  if (!cached.promise) {
-    cached.promise = mongoose
-      .connect(MONGODB_URI, {
-        bufferCommands:              false,
-        maxPoolSize:                 5,
-        serverSelectionTimeoutMS:    5000,  // fail fast — don't hang for 30s
-        socketTimeoutMS:             10000,
-        connectTimeoutMS:            5000,
-        heartbeatFrequencyMS:        30000,
-      })
-      .then((m) => { console.log("[DB] MongoDB connected ✓"); return m; })
-      .catch((err) => { cached.promise = null; throw err; });
-  }
-
-  cached.conn = await cached.promise;
-  return cached.conn;
+function createPool(): Pool {
+  return new Pool({
+    connectionString:    process.env.DATABASE_URL,
+    max:                 10,
+    idleTimeoutMillis:   30000,
+    connectionTimeoutMillis: 5000,
+    ssl: process.env.NODE_ENV === "production"
+      ? { rejectUnauthorized: false }
+      : false,
+  });
 }
 
-export default connectDB;
+// Reuse pool across hot-reloads in Next.js dev mode
+const pool: Pool = global.__pgPool ?? createPool();
+if (process.env.NODE_ENV !== "production") {
+  global.__pgPool = pool;
+}
+
+pool.on("connect", () => console.log("[DB] PostgreSQL connected ✓"));
+pool.on("error",   (err) => console.error("[DB] Pool error:", err.message));
+
+export { pool };
+export default pool;

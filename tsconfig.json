@@ -35,7 +35,7 @@
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
     "next.config.js"
-  ],
+, "src/scripts/migrate.js"  ],
   "exclude": [
     "node_modules"
   ]

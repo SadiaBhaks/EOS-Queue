@@ -1,16 +1,14 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  GET /api/workers — Worker Registry
-// ─────────────────────────────────────────────────────────────────────────────
-
 import { NextResponse } from "next/server";
-import connectDB from "@/lib/db/connections";
-import { WorkerModel } from "@/lib/db/models";
+import { pool } from "@/lib/db/connections";
+import { initSchema } from "@/lib/db/models";
 
 export async function GET() {
   try {
-    await connectDB();
-    const workers = await WorkerModel.find().sort({ last_seen: -1 }).limit(50).lean();
-    return NextResponse.json({ workers });
+    await initSchema();
+    const result = await pool.query(
+      `SELECT * FROM workers ORDER BY last_seen DESC LIMIT 50`
+    );
+    return NextResponse.json({ workers: result.rows });
   } catch (err) {
     console.error("[GET /api/workers]", err);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });

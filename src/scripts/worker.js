@@ -1,235 +1,159 @@
 #!/usr/bin/env node
-// ─────────────────────────────────────────────────────────────────────────────
-//  EOS Queue — Worker Process
-//  Fixed: thundering herd, connection exhaustion, heartbeat flooding,
-//         exponential backoff on errors, graceful shutdown
-// ─────────────────────────────────────────────────────────────────────────────
-
 require("dotenv").config({ path: ".env.local" });
 
-const mongoose = require("mongoose");
+const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 
-// ── Config — conservative defaults to protect low-end machines ────────────────
-const MONGODB_URI     = process.env.MONGODB_URI  ;
-const CONCURRENCY     = Math.min(parseInt(process.env.WORKER_CONCURRENCY), 5); // hard cap at 5
-const HEARTBEAT_MS    = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL ); // 10s (was 5s)
-const VISIBILITY_MS   = parseInt(process.env.WORKER_VISIBILITY_TIMEOUT ); // 60s
-const MAX_RETRIES     = parseInt(process.env.MAX_RETRY_COUNT   );
-const BASE_DELAY      = parseInt(process.env.RETRY_BASE_DELAY   );
-const MAX_DELAY       = parseInt(process.env.RETRY_MAX_DELAY   );
-const IDEMPOTENCY_TTL = parseInt(process.env.IDEMPOTENCY_KEY_TTL    );
-const POLL_INTERVAL   = 2000; // 2s between polls (was 500ms — was DDOS-ing own DB)
-const ZOMBIE_INTERVAL = 30000; // 30s between zombie scans (was 10s)
+const DATABASE_URL    = process.env.DATABASE_URL;
+const CONCURRENCY     = Math.min(parseInt(process.env.WORKER_CONCURRENCY || "2"), 5);
+const HEARTBEAT_MS    = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL   || "10000");
+const VISIBILITY_MS   = parseInt(process.env.WORKER_VISIBILITY_TIMEOUT   || "60000");
+const MAX_RETRIES     = parseInt(process.env.MAX_RETRY_COUNT              || "5");
+const BASE_DELAY      = parseInt(process.env.RETRY_BASE_DELAY             || "1000");
+const MAX_DELAY       = parseInt(process.env.RETRY_MAX_DELAY              || "60000");
+const IDEM_TTL_SEC    = parseInt(process.env.IDEMPOTENCY_TTL_SECONDS      || "604800");
+const POLL_INTERVAL   = 2000;
+const ZOMBIE_INTERVAL = 30000;
 
-// ── Graceful shutdown flag ─────────────────────────────────────────────────────
 let isShuttingDown = false;
 
-// ── Jittered Exponential Backoff ───────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  max:              CONCURRENCY + 2,
+  ssl:              { rejectUnauthorized: false },
+});
+
 function calcBackoff(retryCount) {
   const exp    = Math.min(BASE_DELAY * Math.pow(2, retryCount), MAX_DELAY);
   const jitter = Math.random() * exp * 0.3;
   return Math.floor(exp + jitter);
 }
 
-// ── Mongoose Schemas ───────────────────────────────────────────────────────────
-const TaskSchema = new mongoose.Schema({
-  task_id:            { type: String, required: true, unique: true },
-  idempotency_key:    { type: String, required: true },
-  name:               String,
-  payload:            mongoose.Schema.Types.Mixed,
-  status:             { type: String, default: "PENDING" },
-  priority_level:     { type: Number, default: 3 },
-  retry_count:        { type: Number, default: 0 },
-  max_retries:        { type: Number, default: 5 },
-  worker_id:          { type: String, default: null },
-  claimed_at:         { type: Date,   default: null },
-  visibility_timeout: { type: Number, default: 60000 },
-  last_heartbeat:     { type: Date,   default: null },
-  next_retry_at:      { type: Date,   default: null },
-  error_message:      { type: String, default: null },
-  dlq:                { type: Boolean, default: false },
-  completed_at:       { type: Date,   default: null },
-}, { timestamps: { createdAt: "created_at", updatedAt: "updated_at" } });
-
-const IdempotencySchema = new mongoose.Schema({
-  idempotency_key: { type: String, unique: true },
-  task_id:         String,
-  result:          mongoose.Schema.Types.Mixed,
-  expires_at:      Date,
-}, { timestamps: { createdAt: "created_at", updatedAt: false } });
-
-const DLQSchema = new mongoose.Schema({
-  task_id:       String,
-  original_task: mongoose.Schema.Types.Mixed,
-  reason:        String,
-  moved_at:      { type: Date, default: Date.now },
-});
-
-const WorkerSchema = new mongoose.Schema({
-  worker_id:    { type: String, unique: true },
-  status:       { type: String, default: "IDLE" },
-  current_task: { type: String, default: null },
-  started_at:   { type: Date,   default: Date.now },
-  last_seen:    { type: Date,   default: Date.now },
-  tasks_done:   { type: Number, default: 0 },
-  tasks_failed: { type: Number, default: 0 },
-});
-
-let Task, Idempotency, DLQ, Worker;
-
-// ── Connect — single shared pool, never reconnect inside a slot ───────────────
-async function connect() {
-  await mongoose.connect(MONGODB_URI, {
-    maxPoolSize:             CONCURRENCY + 2, // one connection per worker + 2 spare
-    minPoolSize:             1,
-    serverSelectionTimeoutMS: 10000,
-    socketTimeoutMS:          45000,
-    heartbeatFrequencyMS:    30000, // MongoDB driver heartbeat — separate from task heartbeat
-  });
-
-  // Register models once — never re-register inside loops
-  Task        = mongoose.models.Task        || mongoose.model("Task",        TaskSchema);
-  Idempotency = mongoose.models.Idempotency || mongoose.model("Idempotency", IdempotencySchema);
-  DLQ         = mongoose.models.DLQ         || mongoose.model("DLQ",         DLQSchema);
-  Worker      = mongoose.models.Worker      || mongoose.model("Worker",      WorkerSchema);
-
-  console.log(`[Worker] MongoDB connected ✓  (pool size: ${CONCURRENCY + 2})`);
-}
-
-// ── Atomic Claim ───────────────────────────────────────────────────────────────
+// ── Atomic Claim — SELECT FOR UPDATE SKIP LOCKED ──────────────────────────────
 async function claim(workerId) {
-  const now = new Date();
-  const task = await Task.findOneAndUpdate(
-    {
-      $or: [
-        { status: "PENDING",    next_retry_at: null },
-        { status: "PENDING",    next_retry_at: { $lte: now } },
-        { status: "RECOVERING", next_retry_at: { $lte: now } },
-      ],
-      dlq: false,
-    },
-    {
-      $set: {
-        status:         "CLAIMED",
-        worker_id:      workerId,
-        claimed_at:     now,
-        last_heartbeat: now,
-      },
-    },
-    { sort: { priority_level: -1, created_at: 1 }, new: true }
-  ).lean();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  if (!task) return null;
+    const result = await client.query(`
+      SELECT * FROM tasks
+      WHERE dlq = FALSE
+        AND (
+          (status = 'PENDING'    AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+          OR
+          (status = 'RECOVERING' AND next_retry_at <= NOW())
+        )
+      ORDER BY priority_level DESC, created_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    `);
 
-  // Fire-and-forget worker registry update — don't await, not critical path
-  Worker.findOneAndUpdate(
-    { worker_id: workerId },
-    { $set: { status: "BUSY", current_task: task.task_id, last_seen: now } },
-    { upsert: true }
-  ).catch(() => {});
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return null;
+    }
 
-  return task;
+    const task = result.rows[0];
+    await client.query(`
+      UPDATE tasks SET
+        status = 'CLAIMED', worker_id = $1,
+        claimed_at = NOW(), last_heartbeat = NOW()
+      WHERE task_id = $2
+    `, [workerId, task.task_id]);
+
+    await client.query("COMMIT");
+
+    // Register worker
+    pool.query(`
+      INSERT INTO workers (worker_id, status, current_task, last_seen)
+      VALUES ($1, 'BUSY', $2, NOW())
+      ON CONFLICT (worker_id) DO UPDATE
+        SET status = 'BUSY', current_task = $2, last_seen = NOW()
+    `, [workerId, task.task_id]).catch(() => {});
+
+    return task;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-// ── Complete ───────────────────────────────────────────────────────────────────
 async function complete(taskId, workerId, result) {
-  const task = await Task.findOne({ task_id: taskId }).lean();
-  if (!task || task.worker_id !== workerId) return;
-
-  const now = new Date();
-
-  // Write idempotency record first — this is the EOS guarantee
-  await Idempotency.updateOne(
-    { idempotency_key: task.idempotency_key },
-    {
-      $setOnInsert: {
-        idempotency_key: task.idempotency_key,
-        task_id:         taskId,
-        result,
-        created_at:      now,
-        expires_at:      new Date(now.getTime() + IDEMPOTENCY_TTL),
-      },
-    },
-    { upsert: true }
+  const taskRes = await pool.query(
+    `SELECT * FROM tasks WHERE task_id = $1 AND worker_id = $2`,
+    [taskId, workerId]
   );
+  if (taskRes.rows.length === 0) return;
 
-  // Then mark task complete
-  await Task.findOneAndUpdate(
-    { task_id: taskId, worker_id: workerId },
-    { $set: { status: "COMPLETED", completed_at: now, worker_id: null } }
-  );
+  const task = taskRes.rows[0];
+  const exp  = new Date(Date.now() + IDEM_TTL_SEC * 1000);
 
-  // Fire-and-forget worker stat update
-  Worker.findOneAndUpdate(
-    { worker_id: workerId },
-    { $set: { status: "IDLE", current_task: null, last_seen: now }, $inc: { tasks_done: 1 } }
-  ).catch(() => {});
+  await pool.query(`
+    INSERT INTO idempotency_records (idempotency_key, task_id, result, expires_at)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (idempotency_key) DO NOTHING
+  `, [task.idempotency_key, taskId, JSON.stringify(result), exp]);
+
+  await pool.query(`
+    UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), worker_id = NULL
+    WHERE task_id = $1 AND worker_id = $2
+  `, [taskId, workerId]);
+
+  pool.query(`
+    UPDATE workers SET status = 'IDLE', current_task = NULL,
+      last_seen = NOW(), tasks_done = tasks_done + 1
+    WHERE worker_id = $1
+  `, [workerId]).catch(() => {});
 }
 
-// ── Fail ───────────────────────────────────────────────────────────────────────
 async function fail(taskId, workerId, error) {
-  const task = await Task.findOne({ task_id: taskId }).lean();
-  if (!task || task.worker_id !== workerId) return;
+  const taskRes = await pool.query(
+    `SELECT * FROM tasks WHERE task_id = $1 AND worker_id = $2`,
+    [taskId, workerId]
+  );
+  if (taskRes.rows.length === 0) return;
 
-  const now           = new Date();
+  const task          = taskRes.rows[0];
   const newRetryCount = task.retry_count + 1;
 
   if (newRetryCount > task.max_retries) {
-    // Budget exhausted → DLQ
-    await DLQ.create({
-      task_id:       taskId,
-      original_task: task,
-      reason:        error,
-      moved_at:      now,
-    });
-    await Task.findOneAndUpdate(
-      { task_id: taskId },
-      { $set: { status: "FAILED", failed_at: now, error_message: error, worker_id: null, dlq: true } }
-    );
+    await pool.query(`
+      INSERT INTO dlq_entries (task_id, original_task, reason)
+      VALUES ($1, $2, $3)
+    `, [taskId, JSON.stringify(task), error]);
+
+    await pool.query(`
+      UPDATE tasks SET status = 'FAILED', failed_at = NOW(),
+        error_message = $1, worker_id = NULL, dlq = TRUE
+      WHERE task_id = $2
+    `, [error, taskId]);
   } else {
-    // Retry with jittered backoff
     const delay  = calcBackoff(newRetryCount);
-    const nextAt = new Date(now.getTime() + delay);
-    await Task.findOneAndUpdate(
-      { task_id: taskId },
-      {
-        $set: {
-          status:        "PENDING",
-          retry_count:   newRetryCount,
-          next_retry_at: nextAt,
-          error_message: error,
-          worker_id:     null,
-          claimed_at:    null,
-        },
-      }
-    );
+    const nextAt = new Date(Date.now() + delay);
+    await pool.query(`
+      UPDATE tasks SET status = 'PENDING', retry_count = $1,
+        next_retry_at = $2, error_message = $3,
+        worker_id = NULL, claimed_at = NULL
+      WHERE task_id = $4
+    `, [newRetryCount, nextAt, error, taskId]);
   }
 
-  // Fire-and-forget
-  Worker.findOneAndUpdate(
-    { worker_id: workerId },
-    { $set: { status: "IDLE", current_task: null, last_seen: now }, $inc: { tasks_failed: 1 } }
-  ).catch(() => {});
+  pool.query(`
+    UPDATE workers SET status = 'IDLE', current_task = NULL,
+      last_seen = NOW(), tasks_failed = tasks_failed + 1
+    WHERE worker_id = $1
+  `, [workerId]).catch(() => {});
 }
 
-// ── Task Handler (Simulated Work) ──────────────────────────────────────────────
 async function handleTask(task) {
-  const delay = Math.floor(Math.random() * 2000) + 500; // 0.5–2.5s
+  const delay = Math.floor(Math.random() * 2000) + 500;
   await new Promise((r) => setTimeout(r, delay));
-
-  // Simulate ~15% failure rate
-  if (Math.random() < 0.15) {
-    throw new Error(`Simulated processing error for task ${task.task_id}`);
-  }
-
+  if (Math.random() < 0.15) throw new Error(`Simulated error for ${task.task_id}`);
   return { processed_at: new Date().toISOString(), duration_ms: delay };
 }
 
-// ── Worker Slot ────────────────────────────────────────────────────────────────
-// Fixed: exponential backoff on consecutive errors prevents thundering herd
-// Fixed: heartbeat uses longer interval, doesn't flood DB
-// Fixed: isShuttingDown check exits cleanly
 async function runSlot(workerId) {
   let consecutiveErrors = 0;
 
@@ -238,7 +162,7 @@ async function runSlot(workerId) {
       const task = await claim(workerId);
 
       if (!task) {
-        consecutiveErrors = 0; // clean poll — reset error counter
+        consecutiveErrors = 0;
         await new Promise((r) => setTimeout(r, POLL_INTERVAL));
         continue;
       }
@@ -246,22 +170,18 @@ async function runSlot(workerId) {
       consecutiveErrors = 0;
       console.log(`[${workerId}] Claimed: ${task.name} (${task.task_id.slice(0, 8)})`);
 
-      // ── Heartbeat — fires every HEARTBEAT_MS, stops on task end ──────────
       let heartbeatActive = true;
       const hbInterval = setInterval(async () => {
         if (!heartbeatActive) return;
-        try {
-          await Task.findOneAndUpdate(
-            { task_id: task.task_id, worker_id: workerId, status: "CLAIMED" },
-            { $set: { last_heartbeat: new Date() } }
-          );
-          await Worker.findOneAndUpdate(
-            { worker_id: workerId },
-            { $set: { last_seen: new Date() } }
-          );
-        } catch (_) {
-          // Heartbeat failure is non-fatal — zombie monitor will recover
-        }
+        pool.query(
+          `UPDATE tasks SET last_heartbeat = NOW()
+           WHERE task_id = $1 AND worker_id = $2 AND status = 'CLAIMED'`,
+          [task.task_id, workerId]
+        ).catch(() => {});
+        pool.query(
+          `UPDATE workers SET last_seen = NOW() WHERE worker_id = $1`,
+          [workerId]
+        ).catch(() => {});
       }, HEARTBEAT_MS);
 
       try {
@@ -270,64 +190,102 @@ async function runSlot(workerId) {
         console.log(`[${workerId}] ✓ Completed: ${task.name}`);
       } catch (err) {
         await fail(task.task_id, workerId, err.message).catch(() => {});
-        console.log(`[${workerId}] ✗ Failed:    ${task.name} — ${err.message}`);
+        console.log(`[${workerId}] ✗ Failed: ${task.name} — ${err.message}`);
       } finally {
-        // Always stop heartbeat — prevents interval leak
         heartbeatActive = false;
         clearInterval(hbInterval);
       }
-
     } catch (err) {
       consecutiveErrors++;
-
-      // Exponential backoff on repeated errors — prevents thundering herd
-      // on DB connection issues: 2s → 4s → 8s → ... capped at 30s
       const backoff = Math.min(2000 * Math.pow(2, consecutiveErrors - 1), 30000);
-      console.error(
-        `[${workerId}] Error #${consecutiveErrors} — backing off ${backoff}ms: ${err.message}`
-      );
+      console.error(`[${workerId}] Error #${consecutiveErrors}, backoff ${backoff}ms:`, err.message);
       await new Promise((r) => setTimeout(r, backoff));
     }
   }
-
-  console.log(`[${workerId}] Slot stopped (shutdown)`);
 }
 
-// ── Zombie Monitor — detects workers that died mid-task ───────────────────────
-// Fixed: interval increased from 10s to 30s, errors don't restart the loop
 async function zombieMonitor() {
   while (!isShuttingDown) {
     await new Promise((r) => setTimeout(r, ZOMBIE_INTERVAL));
     if (isShuttingDown) break;
 
     try {
-      const now     = new Date();
-      const zombies = await Task.find({
-        status: "CLAIMED",
-        $expr: {
-          $lt: [
-            "$last_heartbeat",
-            { $subtract: [now, "$visibility_timeout"] },
-          ],
-        },
-      }).lean();
+      const zombies = await pool.query(`
+        SELECT * FROM tasks
+        WHERE status = 'CLAIMED'
+          AND last_heartbeat < NOW() - (visibility_timeout || ' milliseconds')::INTERVAL
+      `);
 
-      if (zombies.length > 0) {
-        console.log(`[ZombieMonitor] Found ${zombies.length} zombie task(s)`);
-      }
-
-      for (const z of zombies) {
+      for (const z of zombies.rows) {
         const newRetry = z.retry_count + 1;
 
         if (newRetry > z.max_retries) {
-          await DLQ.create({
-            task_id:       z.task_id,
-            original_task: z,
-            reason:        "Zombie: heartbeat expired, retry budget exhausted",
-            moved_at:      now,
-          });
-          await Task.findOneAndUpdate(
-            { task_id: z.task_id },
-            { $set: { status: "FAILED", dlq: true, worker_id: null } }
+          await pool.query(
+            `INSERT INTO dlq_entries (task_id, original_task, reason)
+             VALUES ($1, $2, $3)`,
+            [z.task_id, JSON.stringify(z), "Zombie: heartbeat expired"]
           );
-          console.log(`[ZombieMonitor] → DLQ: ${z.task_id.slice(0, 8)}
+          await pool.query(
+            `UPDATE tasks SET status = 'FAILED', dlq = TRUE, worker_id = NULL
+             WHERE task_id = $1 AND status = 'CLAIMED'`,
+            [z.task_id]
+          );
+        } else {
+          const nextAt = new Date(Date.now() + calcBackoff(newRetry));
+          await pool.query(`
+            UPDATE tasks SET
+              status = 'RECOVERING', retry_count = $1,
+              next_retry_at = $2, worker_id = NULL, claimed_at = NULL,
+              error_message = 'Zombie recovery'
+            WHERE task_id = $3 AND status = 'CLAIMED'
+          `, [newRetry, nextAt, z.task_id]);
+          console.log(`[ZombieMonitor] Recovered: ${z.task_id.slice(0, 8)}`);
+        }
+
+        if (z.worker_id) {
+          pool.query(
+            `UPDATE workers SET status = 'DEAD', current_task = NULL
+             WHERE worker_id = $1`,
+            [z.worker_id]
+          ).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error("[ZombieMonitor]", err.message);
+    }
+  }
+}
+
+async function shutdown(signal) {
+  console.log(`\n[Worker] ${signal} — shutting down...`);
+  isShuttingDown = true;
+  await new Promise((r) => setTimeout(r, 5000));
+  await pool.end();
+  console.log("[Worker] Pool closed. Bye.");
+  process.exit(0);
+}
+
+async function main() {
+  console.log(`\n╔══════════════════════════════════════════╗`);
+  console.log(`║  EOS Queue Worker Pool (PostgreSQL)      ║`);
+  console.log(`║  Concurrency: ${String(CONCURRENCY).padEnd(27)}║`);
+  console.log(`║  Poll:        ${String(POLL_INTERVAL + "ms").padEnd(27)}║`);
+  console.log(`║  Heartbeat:   ${String(HEARTBEAT_MS + "ms").padEnd(27)}║`);
+  console.log(`╚══════════════════════════════════════════╝\n`);
+
+  const slots = Array.from({ length: CONCURRENCY }, (_, i) => {
+    const id = `worker-${uuidv4().slice(0, 8)}`;
+    console.log(`[Pool] Starting slot ${i + 1}/${CONCURRENCY}: ${id}`);
+    return runSlot(id);
+  });
+
+  zombieMonitor();
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT",  () => shutdown("SIGINT"));
+  process.on("unhandledRejection", (r) => console.error("[Worker] Unhandled:", r));
+
+  await Promise.all(slots);
+}
+
+main().catch((err) => { console.error("[Worker] Fatal:", err); process.exit(1); });
