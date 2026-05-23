@@ -1,14 +1,6 @@
 @import "tailwindcss";
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   EOS Queue — Global Styles
-   ───────────────────────────────────────────────────────────────────────────── */
-
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&family=DM+Sans:wght@300;400;500;600&display=swap');
-
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
 
 /* ── CSS Variables ────────────────────────────────────────────────────────── */
 :root {
@@ -55,8 +47,9 @@ body {
 
 /* ── Grid Background ─────────────────────────────────────────────────────── */
 .bg-grid {
-  background-image:    var(--tw-gradient-stops, linear-gradient(rgba(245,197,24,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(245,197,24,0.03) 1px, transparent 1px));
-  background-size:     40px 40px;
+  background-image: linear-gradient(rgba(245,197,24,0.03) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(245,197,24,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
 }
 
 /* ── Glow Effects ────────────────────────────────────────────────────────── */
@@ -66,21 +59,22 @@ body {
 .glow-red    { text-shadow: 0 0 20px rgba(239,68,68,0.6); }
 
 /* ── Status Badge Colors ─────────────────────────────────────────────────── */
-.status-pending    { color: #94A3B8; border-color: #334155; background: rgba(51,65,85,0.2); }
+.status-pending    { color: #94A3B8; border-color: #334155;              background: rgba(51,65,85,0.2);    }
 .status-claimed    { color: #F5C518; border-color: rgba(245,197,24,0.4); background: rgba(245,197,24,0.08); }
 .status-completed  { color: #10B981; border-color: rgba(16,185,129,0.4); background: rgba(16,185,129,0.08); }
-.status-failed     { color: #EF4444; border-color: rgba(239,68,68,0.4); background: rgba(239,68,68,0.08); }
+.status-failed     { color: #EF4444; border-color: rgba(239,68,68,0.4);  background: rgba(239,68,68,0.08);  }
 .status-recovering { color: #F97316; border-color: rgba(249,115,22,0.4); background: rgba(249,115,22,0.08); }
 
 /* ── Card Base ───────────────────────────────────────────────────────────── */
 .card {
-  background:   var(--bg-surface);
-  border:       1px solid var(--border-subtle);
+  background:    var(--bg-surface);
+  border:        1px solid var(--border-subtle);
   border-radius: 12px;
-  box-shadow:   0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
-  transition:   border-color 0.2s, box-shadow 0.2s;
+  box-shadow:    0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
+  transition:    border-color 0.2s, box-shadow 0.2s;
 }
 .card:hover { border-color: var(--border-normal); }
+
 .card-elevated {
   background: var(--bg-elevated);
   border:     1px solid var(--border-normal);
@@ -92,20 +86,20 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* ── Scan Line Animation ─────────────────────────────────────────────────── */
+/* ── Scan Line ───────────────────────────────────────────────────────────── */
 .scan-line {
-  position: absolute;
+  position:   absolute;
   left: 0; right: 0;
-  height: 1px;
+  height:     1px;
   background: linear-gradient(90deg, transparent, rgba(245,197,24,0.4), transparent);
-  animation: scan 4s linear infinite;
+  animation:  scan 4s linear infinite;
   pointer-events: none;
 }
 
 @keyframes scan {
-  0%   { top: 0; opacity: 1; }
-  90%  { opacity: 0.5; }
-  100% { top: 100%; opacity: 0; }
+  0%   { top: 0;    opacity: 1;   }
+  90%  {             opacity: 0.5; }
+  100% { top: 100%; opacity: 0;   }
 }
 
 /* ── Pulse Dot ───────────────────────────────────────────────────────────── */
@@ -136,25 +130,8 @@ body {
   100% { transform: scale(2.5); opacity: 0;   }
 }
 
-/* ── Priority Bar ────────────────────────────────────────────────────────── */
-.priority-bar {
-  height: 3px;
-  border-radius: 2px;
-  background: linear-gradient(90deg, var(--accent-yellow), var(--accent-orange));
-}
-
-/* ── Table ────────────────────────────────────────────────────────────────── */
+/* ── Table ───────────────────────────────────────────────────────────────── */
 .table-row-hover:hover { background: rgba(245,197,24,0.03); }
-
-/* ── Three.js Canvas ─────────────────────────────────────────────────────── */
-canvas { display: block; outline: none; }
-
-/* ── Number Ticker ───────────────────────────────────────────────────────── */
-@keyframes countUp {
-  from { transform: translateY(100%); opacity: 0; }
-  to   { transform: translateY(0);    opacity: 1; }
-}
-.count-up { animation: countUp 0.3s ease-out; }
 
 /* ── HUD Border ──────────────────────────────────────────────────────────── */
 .hud-border {
@@ -178,13 +155,8 @@ canvas { display: block; outline: none; }
 }
 
 /* ── Tooltip ─────────────────────────────────────────────────────────────── */
-.tooltip {
-  position: relative;
-}
-.tooltip:hover .tooltip-content {
-  opacity: 1; pointer-events: auto;
-  transform: translateY(0);
-}
+.tooltip { position: relative; }
+.tooltip:hover .tooltip-content { opacity: 1; pointer-events: auto; transform: translateY(0); }
 .tooltip-content {
   position: absolute; bottom: calc(100% + 8px); left: 50%;
   transform: translateX(-50%) translateY(4px);
@@ -197,7 +169,7 @@ canvas { display: block; outline: none; }
   z-index: 50;
 }
 
-/* ── Loading Shimmer ─────────────────────────────────────────────────────── */
+/* ── Shimmer ─────────────────────────────────────────────────────────────── */
 @keyframes shimmer {
   0%   { background-position: -200% 0; }
   100% { background-position:  200% 0; }
@@ -208,9 +180,10 @@ canvas { display: block; outline: none; }
   animation: shimmer 1.5s infinite;
 }
 
-/* ── Mono Code ───────────────────────────────────────────────────────────── */
+/* ── Mono ────────────────────────────────────────────────────────────────── */
 .mono { font-family: 'JetBrains Mono', monospace; }
 
+/* ── Keyframes ───────────────────────────────────────────────────────────── */
 @keyframes spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
@@ -219,4 +192,16 @@ canvas { display: block; outline: none; }
 @keyframes pulse {
   0%, 100% { opacity: 0.2; transform: scale(0.8); }
   50%       { opacity: 1;   transform: scale(1.2); }
+}
+
+@keyframes countUp {
+  from { transform: translateY(100%); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.count-up { animation: countUp 0.3s ease-out; }
+
+@keyframes loading-bar {
+  0%   { width: 0%;  margin-left: 0%;    }
+  50%  { width: 60%; margin-left: 20%;   }
+  100% { width: 0%;  margin-left: 100%;  }
 }
