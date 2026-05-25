@@ -15,6 +15,7 @@
     "test:load": "node scripts/load-test.js"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.3.0",
     "clsx": "^2.1.1",
     "date-fns": "^3.6.0",
     "dotenv": "^17.4.2",
@@ -38,7 +39,7 @@
     "eslint-config-next": "^16.2.4",
     "jest": "^29.7.0",
     "postcss": "^8.4.38",
-    "tailwindcss": "^3.4.4",
+    "tailwindcss": "^3.4.19",
     "typescript": "^5.4.5"
   },
   "overrides": {
