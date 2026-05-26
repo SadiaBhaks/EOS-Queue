@@ -15,6 +15,7 @@
     "test:load": "node scripts/load-test.js"
   },
   "dependencies": {
+    "@tailwindcss/postcss": "^4.3.0",
     "@tailwindcss/vite": "^4.3.0",
     "clsx": "^2.1.1",
     "date-fns": "^3.6.0",
