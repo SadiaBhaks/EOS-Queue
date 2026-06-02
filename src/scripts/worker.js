@@ -8,12 +8,12 @@ const DATABASE_URL    = process.env.DATABASE_URL;
 const CONCURRENCY     = Math.min(parseInt(process.env.WORKER_CONCURRENCY || "2"), 5);
 const HEARTBEAT_MS    = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL   || "10000");
 const VISIBILITY_MS   = parseInt(process.env.WORKER_VISIBILITY_TIMEOUT   || "60000");
-const MAX_RETRIES     = parseInt(process.env.MAX_RETRY_COUNT              || "5");
 const BASE_DELAY      = parseInt(process.env.RETRY_BASE_DELAY             || "1000");
 const MAX_DELAY       = parseInt(process.env.RETRY_MAX_DELAY              || "60000");
 const IDEM_TTL_SEC    = parseInt(process.env.IDEMPOTENCY_TTL_SECONDS      || "604800");
 const POLL_INTERVAL   = 2000;
 const ZOMBIE_INTERVAL = 30000;
+const IDLE_KEEPALIVE  = 10000;
 
 let isShuttingDown = false;
 
@@ -29,7 +29,7 @@ function calcBackoff(retryCount) {
   return Math.floor(exp + jitter);
 }
 
-// ── Atomic Claim — SELECT FOR UPDATE SKIP LOCKED ──────────────────────────────
+// ── Atomic Claim ──────────────────────────────────────────────────────────────
 async function claim(workerId) {
   const client = await pool.connect();
   try {
@@ -63,7 +63,6 @@ async function claim(workerId) {
 
     await client.query("COMMIT");
 
-    // Register worker
     pool.query(`
       INSERT INTO workers (worker_id, status, current_task, last_seen)
       VALUES ($1, 'BUSY', $2, NOW())
@@ -80,6 +79,7 @@ async function claim(workerId) {
   }
 }
 
+// ── Complete ──────────────────────────────────────────────────────────────────
 async function complete(taskId, workerId, result) {
   const taskRes = await pool.query(
     `SELECT * FROM tasks WHERE task_id = $1 AND worker_id = $2`,
@@ -108,6 +108,7 @@ async function complete(taskId, workerId, result) {
   `, [workerId]).catch(() => {});
 }
 
+// ── Fail ──────────────────────────────────────────────────────────────────────
 async function fail(taskId, workerId, error) {
   const taskRes = await pool.query(
     `SELECT * FROM tasks WHERE task_id = $1 AND worker_id = $2`,
@@ -147,6 +148,7 @@ async function fail(taskId, workerId, error) {
   `, [workerId]).catch(() => {});
 }
 
+// ── Simulated Task Handler ─────────────────────────────────────────────────────
 async function handleTask(task) {
   const delay = Math.floor(Math.random() * 2000) + 500;
   await new Promise((r) => setTimeout(r, delay));
@@ -154,7 +156,25 @@ async function handleTask(task) {
   return { processed_at: new Date().toISOString(), duration_ms: delay };
 }
 
+// ── Worker Slot ───────────────────────────────────────────────────────────────
 async function runSlot(workerId) {
+  // ── Register immediately on startup ──────────────────────────────────────
+  await pool.query(`
+    INSERT INTO workers (worker_id, status, current_task, last_seen)
+    VALUES ($1, 'IDLE', NULL, NOW())
+    ON CONFLICT (worker_id) DO UPDATE
+      SET status = 'IDLE', last_seen = NOW()
+  `, [workerId]).catch(() => {});
+
+  // ── Keepalive — update last_seen every 10s even when idle ─────────────────
+  const keepalive = setInterval(() => {
+    if (isShuttingDown) { clearInterval(keepalive); return; }
+    pool.query(
+      `UPDATE workers SET last_seen = NOW() WHERE worker_id = $1`,
+      [workerId]
+    ).catch(() => {});
+  }, IDLE_KEEPALIVE);
+
   let consecutiveErrors = 0;
 
   while (!isShuttingDown) {
@@ -163,6 +183,12 @@ async function runSlot(workerId) {
 
       if (!task) {
         consecutiveErrors = 0;
+        // Mark IDLE when no tasks available
+        pool.query(
+          `UPDATE workers SET status = 'IDLE', current_task = NULL,
+             last_seen = NOW() WHERE worker_id = $1`,
+          [workerId]
+        ).catch(() => {});
         await new Promise((r) => setTimeout(r, POLL_INTERVAL));
         continue;
       }
@@ -195,6 +221,7 @@ async function runSlot(workerId) {
         heartbeatActive = false;
         clearInterval(hbInterval);
       }
+
     } catch (err) {
       consecutiveErrors++;
       const backoff = Math.min(2000 * Math.pow(2, consecutiveErrors - 1), 30000);
@@ -202,8 +229,12 @@ async function runSlot(workerId) {
       await new Promise((r) => setTimeout(r, backoff));
     }
   }
+
+  clearInterval(keepalive);
+  console.log(`[${workerId}] Stopped`);
 }
 
+// ── Zombie Monitor ────────────────────────────────────────────────────────────
 async function zombieMonitor() {
   while (!isShuttingDown) {
     await new Promise((r) => setTimeout(r, ZOMBIE_INTERVAL));
@@ -256,6 +287,7 @@ async function zombieMonitor() {
   }
 }
 
+// ── Graceful Shutdown ─────────────────────────────────────────────────────────
 async function shutdown(signal) {
   console.log(`\n[Worker] ${signal} — shutting down...`);
   isShuttingDown = true;
@@ -265,19 +297,30 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`\n╔══════════════════════════════════════════╗`);
   console.log(`║  EOS Queue Worker Pool (PostgreSQL)      ║`);
   console.log(`║  Concurrency: ${String(CONCURRENCY).padEnd(27)}║`);
   console.log(`║  Poll:        ${String(POLL_INTERVAL + "ms").padEnd(27)}║`);
   console.log(`║  Heartbeat:   ${String(HEARTBEAT_MS + "ms").padEnd(27)}║`);
+  console.log(`║  Keepalive:   ${String(IDLE_KEEPALIVE + "ms").padEnd(27)}║`);
   console.log(`╚══════════════════════════════════════════╝\n`);
 
-  const slots = Array.from({ length: CONCURRENCY }, (_, i) => {
-    const id = `worker-${uuidv4().slice(0, 8)}`;
-    console.log(`[Pool] Starting slot ${i + 1}/${CONCURRENCY}: ${id}`);
-    return runSlot(id);
-  });
+  const workerIds = Array.from({ length: CONCURRENCY }, () => `worker-${uuidv4().slice(0, 8)}`);
+
+  // Register all workers upfront before starting slots
+  for (const id of workerIds) {
+    await pool.query(`
+      INSERT INTO workers (worker_id, status, current_task, last_seen)
+      VALUES ($1, 'IDLE', NULL, NOW())
+      ON CONFLICT (worker_id) DO UPDATE
+        SET status = 'IDLE', last_seen = NOW()
+    `, [id]).catch(() => {});
+    console.log(`[Pool] Registered: ${id}`);
+  }
+
+  const slots = workerIds.map((id) => runSlot(id));
 
   zombieMonitor();
 
@@ -288,4 +331,7 @@ async function main() {
   await Promise.all(slots);
 }
 
-main().catch((err) => { console.error("[Worker] Fatal:", err); process.exit(1); });
+main().catch((err) => {
+  console.error("[Worker] Fatal:", err);
+  process.exit(1);
+});

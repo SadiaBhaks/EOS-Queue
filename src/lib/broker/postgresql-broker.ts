@@ -1,7 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  EOS Queue — PostgreSQL Broker
-//  Atomic claim uses SELECT ... FOR UPDATE SKIP LOCKED — the SQL equivalent
-//  of Redis SETNX or MongoDB findOneAndUpdate
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { v4 as uuidv4 } from "uuid";
@@ -20,7 +18,6 @@ async function ensureSchema() {
   if (!schemaReady) { await initSchema(); schemaReady = true; }
 }
 
-// ── Row → Task mapper ─────────────────────────────────────────────────────────
 function rowToTask(r: Record<string, unknown>): Task {
   return {
     _id:                String(r.id),
@@ -55,7 +52,6 @@ export class PostgreSQLBroker implements IBroker {
     const task_id         = dto.task_id         || uuidv4();
     const idempotency_key = dto.idempotency_key || task_id;
 
-    // Check idempotency — if key exists, reject as duplicate
     const existing = await pool.query(
       `SELECT task_id FROM idempotency_records WHERE idempotency_key = $1`,
       [idempotency_key]
@@ -87,9 +83,7 @@ export class PostgreSQLBroker implements IBroker {
     return rowToTask(result.rows[0]);
   }
 
-  // ── Claim (Atomic — SELECT FOR UPDATE SKIP LOCKED) ───────────────────────────
-  // SKIP LOCKED is the key: multiple workers run this query simultaneously,
-  // each gets a DIFFERENT row — guaranteed no double-claiming
+  // ── Claim ────────────────────────────────────────────────────────────────────
   async claim(workerId: string): Promise<Task | null> {
     await ensureSchema();
 
@@ -107,7 +101,7 @@ export class PostgreSQLBroker implements IBroker {
            )
          ORDER BY priority_level DESC, created_at ASC
          LIMIT 1
-         FOR UPDATE SKIP LOCKED`,
+         FOR UPDATE SKIP LOCKED`
       );
 
       if (result.rows.length === 0) {
@@ -130,7 +124,6 @@ export class PostgreSQLBroker implements IBroker {
 
       await client.query("COMMIT");
 
-      // Register worker (fire and forget)
       pool.query(
         `INSERT INTO workers (worker_id, status, current_task, last_seen)
          VALUES ($1, 'BUSY', $2, NOW())
@@ -139,8 +132,13 @@ export class PostgreSQLBroker implements IBroker {
         [workerId, row.task_id]
       ).catch(() => {});
 
-      return rowToTask({ ...row, status: "CLAIMED", worker_id: workerId,
-        claimed_at: now, last_heartbeat: now });
+      return rowToTask({
+        ...row,
+        status:         "CLAIMED",
+        worker_id:      workerId,
+        claimed_at:     now,
+        last_heartbeat: now,
+      });
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -163,7 +161,6 @@ export class PostgreSQLBroker implements IBroker {
     const now  = new Date();
     const exp  = new Date(now.getTime() + IDEM_TTL_SEC * 1000);
 
-    // Write idempotency record first — the EOS guarantee
     await pool.query(
       `INSERT INTO idempotency_records
          (idempotency_key, task_id, result, expires_at)
@@ -201,7 +198,6 @@ export class PostgreSQLBroker implements IBroker {
     const newRetryCount = task.retry_count + 1;
 
     if (newRetryCount > task.max_retries) {
-      // Move to DLQ
       await pool.query(
         `INSERT INTO dlq_entries (task_id, original_task, reason, moved_at)
          VALUES ($1, $2, $3, $4)`,
@@ -320,8 +316,11 @@ export class PostgreSQLBroker implements IBroker {
          WHERE status = 'COMPLETED'
            AND completed_at > NOW() - INTERVAL '60 seconds'`
       ),
+      // ── Count all non-dead workers seen in last hour ──
       pool.query(
-        `SELECT COUNT(*)::int as count FROM workers WHERE status = 'BUSY'`
+        `SELECT COUNT(*)::int as count FROM workers
+         WHERE status != 'DEAD'
+           AND last_seen > NOW() - INTERVAL '1 hour'`
       ),
     ]);
 
@@ -334,10 +333,10 @@ export class PostgreSQLBroker implements IBroker {
       completed:      counts["COMPLETED"]  || 0,
       failed:         counts["FAILED"]     || 0,
       recovering:     counts["RECOVERING"] || 0,
-      dlq:            dlqRes.rows[0]?.count || 0,
+      dlq:            dlqRes.rows[0]?.count    || 0,
       throughput:     (throughputRes.rows[0]?.count || 0) / 60,
-      avg_latency:    latencyRes.rows[0]?.avg_ms || 0,
-      active_workers: workersRes.rows[0]?.count || 0,
+      avg_latency:    latencyRes.rows[0]?.avg_ms   || 0,
+      active_workers: workersRes.rows[0]?.count    || 0,
       total_tasks:    Object.values(counts).reduce((a, b) => a + b, 0),
     };
   }
