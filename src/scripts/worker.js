@@ -11,7 +11,8 @@ const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
 
 // ── Optional service clients (only loaded if credentials exist) ───────────────
-let sgMail, stripe, twilioClient, s3Client, S3PutObject;
+let resend, stripe, twilioClient, s3Client, S3PutObject;
+
 
 try {
   if (process.env.SENDGRID_API_KEY) {
@@ -27,14 +28,13 @@ try {
     console.log("[Services] Stripe ✓");
   }
 } catch (_) { console.log("[Services] Stripe — not installed (npm install stripe)"); }
-
 try {
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    const twilio = require("twilio");
-    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    console.log("[Services] Twilio ✓");
+  if (process.env.RESEND_API_KEY) {
+    const { Resend } = require("resend");
+    resend = new Resend(process.env.RESEND_API_KEY);
+    console.log("[Services] Resend ✓");
   }
-} catch (_) { console.log("[Services] Twilio — not installed (npm install twilio)"); }
+} catch (_) { console.log("[Services] Resend — not installed (npm install resend)"); }
 
 try {
   if (process.env.AWS_ACCESS_KEY_ID) {
@@ -122,34 +122,44 @@ async function simulate(serviceName, action, durationMs = 500) {
 
 // ── Email ─────────────────────────────────────────────────────────────────────
 async function sendEmail(payload) {
-  const { to, subject, template, body, user_id } = payload;
+  const { to, subject, template, body } = payload;
   if (!to)      throw new Error("Missing required field: to");
   if (!subject) throw new Error("Missing required field: subject");
 
-  if (sgMail && process.env.EMAIL_FROM) {
-    // Real SendGrid integration
-    await withRetry(() =>
-      sgMail.send({
-        to,
+  if (resend && process.env.EMAIL_FROM) {
+    // Real Resend integration
+    const { data, error } = await withRetry(() =>
+      resend.emails.send({
         from:    process.env.EMAIL_FROM,
+        to,
         subject,
         html:    body || `<p>Hello! This email was sent via EOS Queue. Template: ${template || "default"}</p>`,
       })
     );
-    console.log(`    [email] ✓ Sent via SendGrid to ${to}`);
-  } else {
-    // Simulated — add SENDGRID_API_KEY + EMAIL_FROM to .env.local to use real sending
-    await simulate("SendGrid", `send "${subject}" to ${to}`, 300);
-  }
 
-  return {
-    sent:       true,
-    to,
-    subject,
-    provider:   sgMail ? "sendgrid" : "simulated",
-    sent_at:    new Date().toISOString(),
-    message_id: `msg_${Date.now()}`,
-  };
+    if (error) throw new Error(error.message || "Resend send failed");
+
+    console.log(`    [email] ✓ Sent via Resend to ${to}`);
+    return {
+      sent:       true,
+      to,
+      subject,
+      provider:   "resend",
+      sent_at:    new Date().toISOString(),
+      message_id: data?.id || `msg_${Date.now()}`,
+    };
+  } else {
+    // Simulated — add RESEND_API_KEY + EMAIL_FROM to .env.local to use real sending
+    await simulate("Resend", `send "${subject}" to ${to}`, 300);
+    return {
+      sent:       true,
+      to,
+      subject,
+      provider:   "simulated",
+      sent_at:    new Date().toISOString(),
+      message_id: `msg_${Date.now()}`,
+    };
+  }
 }
 
 // ── Payment ───────────────────────────────────────────────────────────────────
