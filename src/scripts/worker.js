@@ -206,12 +206,36 @@ async function processPayment(payload) {
 
 // ── OTP / SMS ─────────────────────────────────────────────────────────────────
 async function sendOTP(payload) {
-  const { phone, code } = payload;
-  if (!phone) throw new Error("Missing required field: phone");
-  if (!code)  throw new Error("Missing required field: code");
+  const { phone, code, email } = payload;
+  if (!code) throw new Error("Missing required field: code");
+  if (!phone && !email) throw new Error("Missing required field: phone or email");
 
-  if (twilioClient && process.env.TWILIO_PHONE_NUMBER) {
-    // Real Twilio integration
+  // ── Prefer email via Resend (no phone verification needed) ──────────────
+  if (email && resend && process.env.EMAIL_FROM) {
+    const { data, error } = await withRetry(() =>
+      resend.emails.send({
+        from:    process.env.EMAIL_FROM,
+        to:      email,
+        subject: "Your verification code",
+        html:    `<h2>Your verification code: <strong>${code}</strong></h2><p>This code expires in 5 minutes. Do not share it with anyone.</p>`,
+      })
+    );
+
+    if (error) throw new Error(error.message || "Resend send failed");
+
+    console.log(`    [otp] ✓ Sent via email to ${email}`);
+    return {
+      sent:        true,
+      channel:     "email",
+      email,
+      message_id:  data?.id || `msg_${Date.now()}`,
+      provider:    "resend",
+      expires_at:  new Date(Date.now() + 300000).toISOString(),
+    };
+  }
+
+  // ── Fall back to Twilio SMS if configured and verified ──────────────────
+  if (phone && twilioClient && process.env.TWILIO_PHONE_NUMBER) {
     const message = await withRetry(() =>
       twilioClient.messages.create({
         body: `Your verification code is: ${code}. Valid for 5 minutes. Do not share this code.`,
@@ -222,21 +246,46 @@ async function sendOTP(payload) {
     console.log(`    [otp] ✓ Sent via Twilio to ${phone} — SID: ${message.sid}`);
     return {
       sent:        true,
+      channel:     "sms",
       phone,
       message_sid: message.sid,
       provider:    "twilio",
       expires_at:  new Date(Date.now() + 300000).toISOString(),
     };
-  } else {
-    // Simulated
-    await simulate("Twilio", `send OTP ${code} to ${phone}`, 250);
-    return {
-      sent:       true,
-      phone,
-      code,
-      provider:   "simulated",
-      expires_at: new Date(Date.now() + 300000).toISOString(),
-    };
+  }
+
+  // ── Simulated fallback ────────────────────────────────────────────────────
+  await simulate("OTP", `send code ${code} to ${email || phone}`, 250);
+  return {
+    sent:       true,
+    channel:    "simulated",
+    target:     email || phone,
+    code,
+    provider:   "simulated",
+    expires_at: new Date(Date.now() + 300000).toISOString(),
+  };
+}
+
+// ── Push Notification ─────────────────────────────────────────────────────────
+async function sendPushNotification(payload) {
+  const { user_id, message, title = "Notification", data = {} } = payload;
+  if (!user_id) throw new Error("Missing required field: user_id");
+  if (!message) throw new Error("Missing required field: message");
+
+  try {
+    // Calls your own Next.js push endpoint
+    // Replace with Firebase Admin SDK for production
+    const res = await withRetry(() =>
+      axios.post(`${APP_URL}/api/push`, {
+        user_id, title, message, data,
+      }, { timeout: 5000 })
+    );
+    console.log(`    [push] ✓ Notified user ${user_id}`);
+    return { sent: true, user_id, notification_id: res.data?.id, provider: "internal" };
+  } catch (_) {
+    // Fallback to simulated if push endpoint doesn't exist yet
+    await simulate("Push", `notify user ${user_id}: "${message}"`, 200);
+    return { sent: true, user_id, provider: "simulated" };
   }
 }
 
