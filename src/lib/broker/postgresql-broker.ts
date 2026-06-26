@@ -14,6 +14,7 @@ const IDEM_TTL_SEC   = parseInt(process.env.IDEMPOTENCY_TTL_SECONDS    || "60480
 
 let schemaReady = false;
 
+
 async function ensureSchema() {
   if (!schemaReady) { await initSchema(); schemaReady = true; }
 }
@@ -389,5 +390,7 @@ export class PostgreSQLBroker implements IBroker {
     }));
   }
 }
+ 
+
 
 export const broker = new PostgreSQLBroker();
